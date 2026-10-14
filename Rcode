@@ -1,0 +1,686 @@
+################################################################################
+# Supplementary code
+# Estimation of the transient relative risk reduction (alpha) of secondary household transmission following antiviral treatment of the index case
+#   Antivirals        : molnupiravir, nirmatrelvir/ritonavir, ensitrelvir
+#   Generation time   : gamma, lognormal, Weibull distributions
+#   Model comparison  : WAIC, PSIS-LOO, harmonic mean estimator, bridge sampling
+################################################################################
+
+library(bridgesampling)
+library(tidyverse)
+library(cmdstanr)
+library(posterior)
+library(bayesplot)
+library(loo)
+library(patchwork)
+library(cowplot)
+
+# set_cmdstan_path("path/to/cmdstan")   # if CmdStan is not found automatically
+theme_set(theme_minimal(base_size = 16))
+
+run_tag         <- "14Oct2026"          
+stan_record_dir <- "stan_models"        
+dir.create(stan_record_dir, showWarnings = FALSE, recursive = TRUE)
+show_plots <- TRUE
+
+# One row per household member exposed to an index case. Required columns:
+#
+#   household_id
+#       Household identifier.
+#   index_case_drug
+#       Antiviral given to the index case:
+#       "1" = molnupiravir, "2" = nirmatrelvir/ritonavir, "3" = ensitrelvir,
+#       "6" = no antiviral (comparison group).
+#   treated
+#       1 if the index case received an antiviral, 0 otherwise.
+#   x_for_index
+#       Time (days) from illness onset of the index case to antiviral
+#       administration. Used only when treated = 1.
+#   index_case_vaccine_type
+#       Type of COVID-19 vaccine last received by the index case before onset:
+#       1-2 = Pfizer/Moderna monovalent XBB.1.5,
+#       3-4 = Pfizer/Moderna bivalent (ancestral + BA.1 or BA.4/BA.5),
+#       5-6 = Pfizer/Moderna monovalent ancestral,
+#       7   = other vaccines,
+#       any other value = unvaccinated.
+#   index_case_vaccine_doses
+#       Number of vaccine doses received by the index case before onset
+#       (v_i in Eq. 2-3; 0 = unvaccinated).
+#   index_case_onset_vaccine_interval
+#       Days from the last vaccination to illness onset of the index case
+#       (1000 = no vaccination record).
+#   index_case_naturalinfection_onset_interval
+#       Days from previous SARS-CoV-2 infection to illness onset of the index
+#       case (1000 = no previous infection).
+#   occupant_infected
+#       1 if the household member became a secondary case, 0 otherwise.
+#   occupant_tau
+#       Generation time (days) from the index case to the secondary case
+#       (secondary cases only; NA otherwise).
+#   occupant_vtype
+#       Vaccine type of the household member (k_j):
+#       1 = Pfizer/Moderna monovalent XBB.1.5,
+#       2 = Pfizer/Moderna bivalent (ancestral + BA.1 or BA.4/BA.5),
+#       3 = Pfizer/Moderna monovalent ancestral,
+#       4 = other vaccines,
+#       5 = unvaccinated (reference).
+data_file <- "occupant_df.rds"
+
+incubation_period <- 2.6                 # infection to illness onset (days), fixed
+ve_infectiousness <- c(0.124, 0.232, 0.328)
+no_record_code <- 1000                   # "no vaccination" / "no previous infection"
+
+# beta_{v_i} / c = 1 - (0.124 delta_{v_i,1} + 0.232 delta_{v_i,2} + 0.328 delta_{v_i,3})
+# The reduction is applied to index cases with a vaccination record.
+index_vaccine_factor <- function(doses, vacc_interval, nat_interval, vtype) {
+  stopifnot(!anyNA(doses), !anyNA(vacc_interval), !anyNA(nat_interval))
+  n  <- pmin(as.integer(doses), 3L)                 # 3 = three or more doses
+  ve <- ifelse(n >= 1L, ve_infectiousness[pmax(n, 1L)], 0)
+  vaccinated  <- vacc_interval != no_record_code
+  prev_infect <- nat_interval  != no_record_code
+  apply_ve    <- vaccinated & (prev_infect | vtype != 5)
+  as.numeric(ifelse(apply_ve, 1 - ve, 1))
+}
+
+drug_config <- list(
+  molnupiravir = list(
+    label = "Molnupiravir", abbr = "mol", drug_codes = c("1", "6"),
+    seeds = c(gamma = 123, lognormal = 123, weibull = 1234), fill = "#F8766D"
+  ),
+  nirmatrelvir = list(
+    label = "Nirmatrelvir/ritonavir", abbr = "nir", drug_codes = c("2", "6"),
+    seeds = c(gamma = 1234, lognormal = 1234, weibull = 1234), fill = "#00BFC4"
+  ),
+  ensitrelvir = list(
+    label = "Ensitrelvir", abbr = "ens", drug_codes = c("3", "6"),
+    seeds = c(gamma = 1234, lognormal = 1234, weibull = 1234), fill = "#C77CFF"
+  )
+)
+for (d in names(drug_config)) {
+  a <- drug_config[[d]]$abbr
+  drug_config[[d]]$rdata_file     <- sprintf("mcmc_%s_%s.Rdata", d, run_tag)
+  drug_config[[d]]$draws_rds_file <- sprintf("draws_lognormal_%s_%s.RDS", d, run_tag)
+  drug_config[[d]]$ci_csv_file    <- sprintf("posterior_summary_lognormal_%s_%s.csv", a, run_tag)
+}
+
+dist_specs <- list(
+  gamma = list(
+    label = "Gamma", dist = "gamma",
+    params = c("shape_g", "rate_g"), lower = c(0, 0), upper = c(30, 30)
+  ),
+  lognormal = list(
+    label = "Lognormal", dist = "lognormal",
+    params = c("mu_g", "sigma_g"), lower = c(-3, 0), upper = c(5, 3)
+  ),
+  weibull = list(
+    label = "Weibull", dist = "weibull",
+    params = c("shape_w", "scale_w"), lower = c(0, 0), upper = c(10, 20)
+  )
+)
+for (d in names(dist_specs)) {
+  s <- dist_specs[[d]]
+  dist_specs[[d]]$decl <- paste(
+    sprintf("real<lower=%s, upper=%s> %s;", s$lower, s$upper, s$params),
+    collapse = "\n  "
+  )
+  dist_specs[[d]]$prior <- paste(
+    sprintf("%s ~ uniform(%s, %s);", s$params, s$lower, s$upper),
+    collapse = "\n  "
+  )
+}
+
+main_pars <- function(dist) c(dist_specs[[dist]]$params, "alpha", "gamma_vtype", "c")
+
+stan_template <- "
+functions {
+  // Cumulative distribution function of the generation time
+  real gt_cumprob(real t, real p1, real p2) {
+    if (t <= 0) return 0.0;
+    return @DIST@_cdf(t | p1, p2);
+  }
+
+  // L1: log-likelihood of the generation time of one secondary case
+  //   x_i = incubation period + time from onset to antiviral administration
+  //   D   = 1 - alpha * (1 - G(x_i))
+  real l1_contrib(real tau, int treated, real x_i, real alpha, real p1, real p2) {
+    real lg = @DIST@_lpdf(tau | p1, p2);
+    if (treated == 0) return lg;
+    real G = gt_cumprob(x_i, p1, p2);
+    real log_D = log1m(alpha * (1.0 - G));
+    if (tau < x_i) return lg - log_D;
+    return log1m(alpha) + lg - log_D;
+  }
+
+  // L2: infection probability of one household member
+  //   beta_{v_i} = c * vaccine_factor_i  (Eq. 3)
+  real p_contact(real c, real vaccine_factor, int k, vector gamma_vtype,
+                 int treated, real x_i, real alpha, real p1, real p2) {
+    real susceptibility = (k == 5) ? 1.0 : gamma_vtype[k];
+    real p = c * vaccine_factor * susceptibility;
+    if (treated == 1) {
+      real G = gt_cumprob(x_i, p1, p2);
+      p *= 1.0 - alpha * (1.0 - G);          // G + (1 - alpha)(1 - G)
+    }
+    return p;
+  }
+}
+data {
+  int<lower=1> N_households;
+  vector<lower=0>[N_households] x_treat;                     // x_i
+  vector<lower=0, upper=1>[N_households] vaccine_factor;     // beta_{v_i} / c
+  array[N_households] int<lower=0, upper=1> treated_household;
+  int<lower=0> N_infected_occupants;
+  array[N_infected_occupants] int<lower=1, upper=N_households> hh_infected;
+  vector<lower=0>[N_infected_occupants] tau_infected;
+  int<lower=0> N_total_occupants;
+  array[N_total_occupants] int<lower=1, upper=N_households> occupant_household;
+  array[N_total_occupants] int<lower=1, upper=5> occupant_vtype;
+  array[N_total_occupants] int<lower=0, upper=1> occupant_infected;
+}
+parameters {
+  @PARAM_DECL@
+  real<lower=0, upper=1> alpha;
+  vector<lower=0, upper=1>[4] gamma_vtype;
+  real<lower=0, upper=1> c;
+}
+model {
+  // Priors
+  @GT_PRIOR@
+  alpha ~ uniform(0, 1);
+  gamma_vtype ~ uniform(0, 1);
+  c ~ uniform(0, 1);
+
+  // L1
+  for (i in 1:N_infected_occupants) {
+    int hh = hh_infected[i];
+    target += l1_contrib(tau_infected[i], treated_household[hh], x_treat[hh],
+                         alpha, @P1@, @P2@);
+  }
+  // L2
+  for (n in 1:N_total_occupants) {
+    int hh = occupant_household[n];
+    real p = p_contact(c, vaccine_factor[hh], occupant_vtype[n], gamma_vtype,
+                       treated_household[hh], x_treat[hh], alpha, @P1@, @P2@);
+    target += bernoulli_lpmf(occupant_infected[n] | p);
+  }
+}
+generated quantities {
+  vector[N_households] log_lik_l1 = rep_vector(0.0, N_households);
+  vector[N_households] log_lik_l2 = rep_vector(0.0, N_households);
+
+  for (i in 1:N_infected_occupants) {
+    int hh = hh_infected[i];
+    log_lik_l1[hh] += l1_contrib(tau_infected[i], treated_household[hh], x_treat[hh],
+                                 alpha, @P1@, @P2@);
+  }
+  for (n in 1:N_total_occupants) {
+    int hh = occupant_household[n];
+    real p = p_contact(c, vaccine_factor[hh], occupant_vtype[n], gamma_vtype,
+                       treated_household[hh], x_treat[hh], alpha, @P1@, @P2@);
+    log_lik_l2[hh] += bernoulli_lpmf(occupant_infected[n] | p);
+  }
+}
+"
+
+build_stan_code <- function(spec) {
+  code <- stan_template
+  code <- gsub("@DIST@",       spec$dist,      code, fixed = TRUE)
+  code <- gsub("@PARAM_DECL@", spec$decl,      code, fixed = TRUE)
+  code <- gsub("@GT_PRIOR@",   spec$prior,     code, fixed = TRUE)
+  code <- gsub("@P1@",         spec$params[1], code, fixed = TRUE)
+  code <- gsub("@P2@",         spec$params[2], code, fixed = TRUE)
+  code
+}
+
+# Harmonic mean estimator of the marginal likelihood (log-sum-exp stabilised)
+stable_harmonic_mean_estimator <- function(log_lik_mat) {
+  log_lik_total <- if (ncol(log_lik_mat) > 1) rowSums(log_lik_mat) else as.vector(log_lik_mat)
+  n    <- length(log_lik_total)
+  vals <- -log_lik_total
+  m    <- max(vals)
+  log_hm <- -(log(sum(exp(vals - m))) - log(n) + m)
+  list(hm = exp(log_hm), log_hm = log_hm)
+}
+
+# Upper axis limit for alpha derived from the posterior draws
+alpha_upper <- function(a, q = 0.999, mult = 1.15) {
+  u <- as.numeric(quantile(a, q)) * mult
+  min(1, max(0.05, u))
+}
+
+## Log posterior for bridge sampling ------
+dist_r_funs <- list(
+  gamma = list(
+    d = function(x, p1, p2, log = FALSE) dgamma(x, shape = p1, rate = p2, log = log),
+    p = function(q, p1, p2) pgamma(q, shape = p1, rate = p2)
+  ),
+  lognormal = list(
+    d = function(x, p1, p2, log = FALSE) dlnorm(x, meanlog = p1, sdlog = p2, log = log),
+    p = function(q, p1, p2) plnorm(q, meanlog = p1, sdlog = p2)
+  ),
+  weibull = list(
+    d = function(x, p1, p2, log = FALSE) dweibull(x, shape = p1, scale = p2, log = log),
+    p = function(q, p1, p2) pweibull(q, shape = p1, scale = p2)
+  )
+)
+
+bridge_par_names <- function(dist) {
+  c(dist_specs[[dist]]$params, "alpha", paste0("gamma_vtype[", 1:4, "]"), "c")
+}
+
+bridge_bounds <- function(dist) {
+  spec <- dist_specs[[dist]]
+  pn   <- bridge_par_names(dist)
+  lb <- setNames(rep(0, length(pn)), pn)
+  ub <- setNames(rep(1, length(pn)), pn)
+  lb[spec$params] <- spec$lower
+  ub[spec$params] <- spec$upper
+  list(lb = lb, ub = ub)
+}
+
+# Log-likelihood L1 + L2
+make_loglik_fun <- function(stan_data, dist) {
+  dfun <- dist_r_funs[[dist]]$d
+  pfun <- dist_r_funs[[dist]]$p
+  pn   <- dist_specs[[dist]]$params
+
+  hh1  <- stan_data$hh_infected
+  tau  <- stan_data$tau_infected
+  x1   <- stan_data$x_treat[hh1]
+  trt1 <- stan_data$treated_household[hh1] == 1
+  late <- trt1 & !(tau < x1)
+
+  hh2   <- stan_data$occupant_household
+  y2    <- stan_data$occupant_infected
+  k2    <- stan_data$occupant_vtype
+  base2 <- stan_data$vaccine_factor[hh2]
+  trt2  <- stan_data$treated_household[hh2] == 1
+  x2    <- stan_data$x_treat[hh2][trt2]
+  gv_names <- paste0("gamma_vtype[", 1:4, "]")
+
+  function(pars) {
+    p1 <- pars[[pn[1]]]; p2 <- pars[[pn[2]]]
+    alpha <- pars[["alpha"]]; c_ <- pars[["c"]]
+    gv <- c(pars[gv_names], 1)                      # k = 5 (unvaccinated) -> 1
+
+    ll1 <- dfun(tau, p1, p2, log = TRUE)
+    if (any(trt1)) {
+      G1 <- pfun(x1[trt1], p1, p2)
+      ll1[trt1] <- ll1[trt1] - log1p(-alpha * (1 - G1))
+    }
+    if (any(late)) ll1[late] <- ll1[late] + log1p(-alpha)
+
+    p <- c_ * base2 * gv[k2]
+    if (any(trt2)) {
+      G2 <- pfun(x2, p1, p2)
+      p[trt2] <- p[trt2] * (1 - alpha * (1 - G2))
+    }
+    if (any(!is.finite(p) | p < 0 | p > 1)) return(-Inf)
+
+    out <- sum(ll1) + sum(dbinom(y2, 1, p, log = TRUE))
+    if (is.na(out)) -Inf else out
+  }
+}
+
+# Log prior density 
+make_log_prior <- function(dist) {
+  bd <- bridge_bounds(dist)
+  log_const <- -sum(log(bd$ub - bd$lb))
+  function(pars) {
+    if (any(pars <= bd$lb | pars >= bd$ub)) return(-Inf)
+    log_const
+  }
+}
+
+# Unnormalised log posterior
+make_log_posterior <- function(stan_data, dist) {
+  loglik    <- make_loglik_fun(stan_data, dist)
+  log_prior <- make_log_prior(dist)
+  pn <- bridge_par_names(dist)
+  function(pars, data) {
+    if (is.null(names(pars))) names(pars) <- pn
+    pars <- pars[pn]
+    lp <- log_prior(pars)
+    if (!is.finite(lp)) return(-Inf)
+    lp + loglik(pars)
+  }
+}
+
+check_loglik <- function(fit, dist, stan_data, n_check = 10) {
+  pn <- bridge_par_names(dist)
+  dd <- as.data.frame(as_draws_df(fit$draws(variables = c(pn, "log_lik_l1", "log_lik_l2"))))
+  idx     <- round(seq(1, nrow(dd), length.out = n_check))
+  ll_stan <- rowSums(as.matrix(dd[idx, grep("^log_lik_l[12]\\[", names(dd))]))
+  ll_fun  <- make_loglik_fun(stan_data, dist)
+  ll_r    <- vapply(idx, function(i) ll_fun(unlist(dd[i, pn])), numeric(1))
+  max(abs(ll_r - ll_stan))
+}
+
+# Bridge sampling using the posterior draws from CmdStan
+run_bridge <- function(fit, dist, stan_data, seed) {
+  pn <- bridge_par_names(dist)
+  samples <- as.matrix(as.data.frame(as_draws_df(fit$draws(variables = pn)))[, pn])
+  bd <- bridge_bounds(dist)
+
+  eps <- 1e-10                                      # keep draws inside the support
+  on_boundary <- sapply(pn, function(j) {
+    sum(samples[, j] <= bd$lb[[j]] | samples[, j] >= bd$ub[[j]])
+  })
+  if (any(on_boundary > 0)) {
+    message(dist, ": draws on the boundary adjusted -> ",
+            paste(names(on_boundary)[on_boundary > 0], on_boundary[on_boundary > 0],
+                  sep = ": ", collapse = ", "))
+  }
+  for (j in pn) {
+    samples[, j] <- pmin(pmax(samples[, j], bd$lb[[j]] + eps), bd$ub[[j]] - eps)
+  }
+  set.seed(seed)
+  bridge_sampler(
+    samples       = samples,
+    log_posterior = make_log_posterior(stan_data, dist),
+    data          = stan_data,
+    lb            = bd$lb,
+    ub            = bd$ub,
+    method        = "normal",
+    silent        = TRUE
+  )
+}
+
+long_lab <- "Transient relative risk reduction of secondary transmission"
+
+run_drug_analysis <- function(drug, cfg, occupant_all) {
+  message("\n==================== ", cfg$label, " ====================")
+
+  # Data
+  occupant_df <- occupant_all %>% filter(index_case_drug %in% cfg$drug_codes)
+
+  household_summary <- occupant_df %>%
+    group_by(household_id) %>%
+    summarise(
+      treated               = first(treated),
+      x_onset_to_treatment  = first(x_for_index),
+      index_vtype_raw       = first(index_case_vaccine_type),
+      index_vaccine_doses   = first(as.integer(index_case_vaccine_doses)),
+      index_vinterval       = first(index_case_onset_vaccine_interval),
+      index_naturalinterval = first(index_case_naturalinfection_onset_interval),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      index_vtype = case_when(
+        index_vtype_raw %in% c(1, 2) ~ 1,
+        index_vtype_raw %in% c(3, 4) ~ 2,
+        index_vtype_raw %in% c(5, 6) ~ 3,
+        index_vtype_raw == 7         ~ 4,
+        TRUE                         ~ 5
+      ),
+      x_onset_to_treatment = ifelse(treated == 1, as.numeric(x_onset_to_treatment), 0),
+      x_treat        = incubation_period + x_onset_to_treatment,
+      vaccine_factor = index_vaccine_factor(index_vaccine_doses, index_vinterval,
+                                            index_naturalinterval, index_vtype)
+    )
+  stopifnot(nrow(household_summary) > 0, !anyNA(household_summary$x_treat))
+
+  occupant_df$hh_index <- match(occupant_df$household_id, household_summary$household_id)
+
+  infected_df <- occupant_df %>%
+    filter(occupant_infected == 1 & !is.na(occupant_tau) & occupant_tau > 0)
+
+  stan_data <- list(
+    N_households         = nrow(household_summary),
+    x_treat              = household_summary$x_treat,
+    vaccine_factor       = household_summary$vaccine_factor,
+    treated_household    = as.integer(household_summary$treated),
+    N_infected_occupants = nrow(infected_df),
+    hh_infected          = as.integer(infected_df$hh_index),
+    tau_infected         = infected_df$occupant_tau,
+    N_total_occupants    = nrow(occupant_df),
+    occupant_household   = as.integer(occupant_df$hh_index),
+    occupant_vtype       = as.integer(occupant_df$occupant_vtype),
+    occupant_infected    = as.integer(occupant_df$occupant_infected)
+  )
+
+  # Stan
+  models <- list()
+  for (dname in names(dist_specs)) {
+    code <- build_stan_code(dist_specs[[dname]])
+    writeLines(code, file.path(stan_record_dir,
+                               sprintf("model_%s_%s_%s.stan", dname, cfg$abbr, run_tag)))
+    models[[dname]] <- cmdstan_model(write_stan_file(code))
+  }
+
+  # MCMC 
+  sample_model <- function(model, seed) {
+    model$sample(
+      data            = stan_data,
+      chains          = 4,
+      parallel_chains = 4,
+      iter_warmup     = 500,
+      iter_sampling   = 1000,
+      seed            = seed,
+      refresh         = 1000,
+      adapt_delta     = 0.99,
+      max_treedepth   = 15,
+      sig_figs        = 18
+    )
+  }
+  fit_gamma     <- sample_model(models$gamma,     cfg$seeds[["gamma"]])
+  fit_lognormal <- sample_model(models$lognormal, cfg$seeds[["lognormal"]])
+  fit_weibull   <- sample_model(models$weibull,   cfg$seeds[["weibull"]])
+
+  # Posterior summaries
+  summ_gamma     <- fit_gamma$summary()
+  summ_lognormal <- fit_lognormal$summary()
+  summ_weibull   <- fit_weibull$summary()
+
+  print(fit_gamma$summary(variables = main_pars("gamma")), n = 30)
+  print(fit_lognormal$summary(variables = main_pars("lognormal")), n = 30)
+  print(fit_weibull$summary(variables = main_pars("weibull")), n = 30)
+
+  posterior_mat  <- as_draws_matrix(fit_gamma$draws())
+  posterior_mat2 <- as_draws_matrix(fit_lognormal$draws())
+  posterior_mat3 <- as_draws_matrix(fit_weibull$draws())
+
+  draws_gamma     <- as_draws_df(fit_gamma$draws())
+  draws_lognormal <- as_draws_df(fit_lognormal$draws())
+  draws_weibull   <- as_draws_df(fit_weibull$draws())
+
+  # Figures 
+  fits  <- list(Gamma = fit_gamma,     Lognormal = fit_lognormal,  Weibull = fit_weibull)
+  pmats <- list(Gamma = posterior_mat, Lognormal = posterior_mat2, Weibull = posterior_mat3)
+  summs <- list(Gamma = summ_gamma,    Lognormal = summ_lognormal, Weibull = summ_weibull)
+
+  plots   <- list()
+  au_list <- list()
+  for (m in names(fits)) {
+    ttl <- paste0(cfg$label, " - ", m, " model")
+
+    d_alpha <- as_draws_df(fits[[m]]$draws(variables = "alpha"))
+    au <- alpha_upper(d_alpha$alpha)
+    au_list[[m]] <- au
+
+    plots[[paste0(m, "_trace")]] <- mcmc_trace(pmats[[m]], pars = "alpha") +
+      coord_cartesian(ylim = c(0, au)) +
+      ylab("Transient relative risk reduction (alpha)") +
+      ggtitle(ttl)
+
+    plots[[paste0(m, "_dens")]] <- mcmc_dens_overlay(pmats[[m]], pars = "alpha") +
+      coord_cartesian(xlim = c(0, au)) +
+      ggtitle(ttl)
+
+    plots[[paste0(m, "_rhat")]] <- mcmc_rhat(summs[[m]]$rhat) +
+      theme_classic() + ggtitle(ttl)
+
+    plots[[paste0(m, "_acf")]] <- mcmc_acf(pmats[[m]], pars = "alpha") + ggtitle(ttl)
+
+    d_alpha$chain <- factor(d_alpha$.chain)
+    d_alpha$group <- cfg$label
+
+    plots[[paste0(m, "_violin_chain")]] <-
+      ggplot(d_alpha, aes(x = chain, y = alpha, fill = chain)) +
+      geom_violin(trim = FALSE, alpha = 0.7) +
+      geom_boxplot(width = 0.1, fill = "grey", outlier.shape = NA) +
+      stat_summary(fun = mean, geom = "point", shape = 21, fill = "white", size = 2) +
+      labs(title = paste0(ttl, ": alpha by chain"), x = "Chain", y = "alpha") +
+      coord_cartesian(ylim = c(0, au)) +
+      theme_minimal(base_size = 14) +
+      theme(plot.title = element_text(face = "bold"))
+
+    plots[[paste0(m, "_violin_pooled")]] <-
+      ggplot(d_alpha, aes(x = group, y = alpha)) +
+      geom_violin(trim = FALSE, fill = "steelblue", alpha = 0.7) +
+      geom_boxplot(width = 0.1, fill = "grey", outlier.shape = NA) +
+      stat_summary(fun = mean, geom = "point", shape = 21, fill = "white", size = 2) +
+      labs(title = paste0(m, " model"), x = "", y = "alpha") +
+      coord_cartesian(ylim = c(0, au)) +
+      theme_minimal(base_size = 20)
+  }
+
+  diag_rows <- lapply(names(fits), function(m) {
+    plot_grid(
+      mcmc_trace(pmats[[m]], pars = "alpha") + ylab(long_lab),
+      mcmc_dens_overlay(pmats[[m]], pars = "alpha") +
+        ylab("Probability density") + xlab(long_lab) +
+        coord_cartesian(xlim = c(0, au_list[[m]])),
+      mcmc_rhat(summs[[m]]$rhat),
+      ncol = 3, align = "hv"
+    )
+  })
+  plots$diagnostic_3rows <- plot_grid(plotlist = diag_rows, ncol = 1, align = "v")
+
+  if (show_plots) for (p in plots) print(p)
+
+  # Posterior means and 95% credible intervals 
+  ci_fun <- list(mean = mean, ~ quantile(.x, probs = c(0.025, 0.975)))
+  ci_95_df1 <- do.call(summarise_draws, c(list(fit_gamma$draws(main_pars("gamma"))),         ci_fun))
+  ci_95_df2 <- do.call(summarise_draws, c(list(fit_lognormal$draws(main_pars("lognormal"))), ci_fun))
+  ci_95_df3 <- do.call(summarise_draws, c(list(fit_weibull$draws(main_pars("weibull"))),     ci_fun))
+  print(ci_95_df1); print(ci_95_df2); print(ci_95_df3)
+
+  # WAIC and PSIS-LOO 
+  log_lik_total <- function(fit) {
+    fit$draws("log_lik_l1", format = "matrix") + fit$draws("log_lik_l2", format = "matrix")
+  }
+  log_lik_total_gamma     <- log_lik_total(fit_gamma)
+  log_lik_total_lognormal <- log_lik_total(fit_lognormal)
+  log_lik_total_weibull   <- log_lik_total(fit_weibull)
+
+  waic_gamma     <- waic(log_lik_total_gamma);     loo_gamma     <- loo(log_lik_total_gamma)
+  waic_lognormal <- waic(log_lik_total_lognormal); loo_lognormal <- loo(log_lik_total_lognormal)
+  waic_weibull   <- waic(log_lik_total_weibull);   loo_weibull   <- loo(log_lik_total_weibull)
+
+  print(waic_gamma);     print(loo_gamma)
+  print(waic_lognormal); print(loo_lognormal)
+  print(waic_weibull);   print(loo_weibull)
+
+  loo_comparison <- loo_compare(list(Gamma = loo_gamma, Lognormal = loo_lognormal,
+                                     Weibull = loo_weibull))
+  print(loo_comparison)
+
+  # Harmonic mean estimator 
+  results <- data.frame(
+    Model = c("Gamma", "Lognormal", "Weibull"),
+    LogMarginalLikelihood = c(
+      stable_harmonic_mean_estimator(log_lik_total_gamma)$log_hm,
+      stable_harmonic_mean_estimator(log_lik_total_lognormal)$log_hm,
+      stable_harmonic_mean_estimator(log_lik_total_weibull)$log_hm
+    )
+  )
+  results$logBF <- results$LogMarginalLikelihood - max(results$LogMarginalLikelihood)
+  print(results)
+
+  # Mean and variance of the generation time (lognormal model)
+  calculated_means     <- exp(draws_lognormal$mu_g + draws_lognormal$sigma_g^2 / 2)
+  calculated_variances <- (exp(draws_lognormal$sigma_g^2) - 1) *
+    exp(2 * draws_lognormal$mu_g + draws_lognormal$sigma_g^2)
+  mean_ci     <- quantile(calculated_means,     probs = c(0.025, 0.975))
+  variance_ci <- quantile(calculated_variances, probs = c(0.025, 0.975))
+
+  cat("\n[", cfg$label, "] Generation time (lognormal model)\n", sep = "")
+  cat("Mean    : median ", median(calculated_means),
+      " (95% CrI ", mean_ci[1], "-", mean_ci[2], ")\n", sep = "")
+  cat("Variance: median ", median(calculated_variances),
+      " (95% CrI ", variance_ci[1], "-", variance_ci[2], ")\n", sep = "")
+
+  # Bridge sampling 
+  ll_check <- c(
+    gamma     = check_loglik(fit_gamma,     "gamma",     stan_data),
+    lognormal = check_loglik(fit_lognormal, "lognormal", stan_data),
+    weibull   = check_loglik(fit_weibull,   "weibull",   stan_data)
+  )
+  cat("\n[", cfg$label, "] Max. absolute difference between R and Stan log-likelihoods:\n",
+      sep = "")
+  print(ll_check)
+  if (any(ll_check > 1e-6)) {
+    warning(cfg$label, ": R and Stan log-likelihoods do not match; ",
+            "bridge sampling results are not valid.")
+  }
+
+  logmalik_gamma     <- run_bridge(fit_gamma,     "gamma",     stan_data, cfg$seeds[["gamma"]])
+  logmalik_lognormal <- run_bridge(fit_lognormal, "lognormal", stan_data, cfg$seeds[["lognormal"]])
+  logmalik_weibull   <- run_bridge(fit_weibull,   "weibull",   stan_data, cfg$seeds[["weibull"]])
+
+  print(error_measures(logmalik_gamma))
+  print(error_measures(logmalik_lognormal))
+  print(error_measures(logmalik_weibull))
+  print(logmalik_gamma); print(logmalik_lognormal); print(logmalik_weibull)
+
+  model_comparison <- post_prob(
+    logmalik_gamma, logmalik_lognormal, logmalik_weibull,
+    model_names = c("Gamma", "Lognormal", "Weibull")
+  )
+  print(model_comparison)
+}
+
+occupant_all <- readRDS(data_file)
+
+results_all <- list()
+for (drug in names(drug_config)) {
+  results_all[[drug]] <- run_drug_analysis(drug, drug_config[[drug]], occupant_all)
+}
+
+# Comparison of alpha across antivirals (lognormal)
+# To redraw from saved files:
+# draws_list <- map(drug_config, ~ readRDS(.x$draws_rds_file))
+draws_list <- map(results_all, "draws_lognormal")
+
+drug_labels <- map_chr(drug_config, "label")
+drug_fills  <- setNames(map_chr(drug_config, "fill"), drug_labels)
+
+combined_df <- imap_dfr(draws_list, ~ tibble(
+  alpha = .x$alpha,
+  Drug  = drug_config[[.y]]$label
+)) %>%
+  mutate(Drug = factor(Drug, levels = drug_labels))
+
+alpha_summary_all <- combined_df %>%
+  group_by(Drug) %>%
+  summarise(
+    mean   = mean(alpha),
+    median = median(alpha),
+    lower  = quantile(alpha, 0.025),
+    upper  = quantile(alpha, 0.975),
+    .groups = "drop"
+  )
+print(alpha_summary_all)
+
+y_upper <- 100 * alpha_upper(combined_df$alpha, q = 0.995, mult = 1.1)
+
+p_combined <- ggplot(combined_df, aes(x = Drug, y = alpha * 100, fill = Drug)) +
+  geom_violin(trim = FALSE, alpha = 0.7, colour = "black", linewidth = 0.5) +
+  geom_boxplot(width = 0.1, fill = "grey", outlier.shape = NA,
+               colour = "black", linewidth = 0.5) +
+  stat_summary(fun = mean, geom = "point", shape = 21,
+               fill = "white", size = 2, colour = "black") +
+  labs(x = NULL, y = "Transient relative risk reduction (%)") +
+  scale_fill_manual(values = drug_fills) +
+  coord_cartesian(ylim = c(0, y_upper)) +
+  theme_minimal() +
+  theme(
+    panel.grid        = element_blank(),
+    axis.line         = element_line(color = "black"),
+    axis.ticks        = element_line(color = "black"),
+    axis.ticks.length = unit(0.25, "cm"),
+    axis.title        = element_text(size = 20, color = "black"),
+    axis.text         = element_text(size = 18, color = "black"),
+    legend.position   = "none"
+  )
